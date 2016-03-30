@@ -1,0 +1,503 @@
+#!/usr/bin/env python
+
+import syslog
+import requests
+import PBridge
+import requests
+import sys
+import re
+import gspread
+import json
+import os
+from oauth2client.client import SignedJwtAssertionCredentials
+import time
+import shelve
+
+exec_path = os.path.dirname(os.path.realpath(__file__))
+## Configuration
+syslog.openlog('Updator')
+json_key = json.load(open("%s/loaner-ae6d295a315c.json" % exec_path))
+shelfFile = shelve.open('%s/config' % exec_path)
+
+# Variables to not edit
+scope = ['https://spreadsheets.google.com/feeds']
+google_credentials = SignedJwtAssertionCredentials(
+    json_key['client_email'], json_key['private_key'].encode(), scope)
+gc = gspread.authorize(google_credentials)
+wks = gc.open("Loaner List")
+
+## Functions
+def error(error_message):
+    print(error_message)
+
+def login():
+    # Gets JSS creds
+    authorized = False
+    while not authorized:
+        authview = """
+        # Set window title
+        *.title = Loaner
+        # Introductory text
+        txt.type = text
+        txt.default = Please Log into Casper
+        txt.height = 50
+        txt.width = 256
+        # Add a text field
+        username.type = textfield
+        username.label = Username
+        username.default = username
+        username.width = 256
+        username.tooltip = Casper Username
+
+        # Add a password field
+        password.type = password
+        password.label = Password
+        password.width = 256
+        password.tooltip = Casper Password
+
+        # Add a cancel button with default label
+        cb.type = cancelbutton
+        """
+
+        result = PBridge.run(authview)
+        if result["cb"] == "1":
+            sys.exit(0)
+        else:
+            user = result["username"]
+            pprompt = result["password"]
+            creds = (user, pprompt)
+            authorized = jsstest(creds)
+        if not authorized:
+            print("Bad credentials or unauthorized")
+    return creds
+
+def jsstest(creds):
+    # Tests that jss creds are valid
+    r = requests.get('https://zenefits.jamfcloud.com/JSSResource/computers', auth=creds)
+    response = (r.status_code)
+    print(response)
+    return r
+
+def get_info_computer(match, creds):
+    # Returns json of computers info
+    sendurl = 'https://zenefits.jamfcloud.com/JSSResource/computers/match/%s' % match
+    header = {'Accept': 'application/json'}
+    r = requests.get(sendurl, auth=creds, headers=header)
+    response = r.json()
+    # print(response)
+    return response
+
+def get_user_info(match_id, creds):
+    sendurl = 'https://zenefits.jamfcloud.com/JSSResource/computers/id/%s' % match_id
+    header = {'Accept': 'application/json'}
+    r = requests.get(sendurl, auth=creds, headers=header)
+    response = r.json()
+    user_info = (response['computer']['location']['real_name'], response['computer']['location']['email_address'])
+    return user_info
+
+def get_info_mode(creds, current_wks):
+    text = "*(Get Info)*"
+    scan = barcode_scan(text)
+    if scan == 'exit':
+        return False
+    else:
+        computer_info = get_info_computer(scan, creds)
+        if len(computer_info['computers']) == 1:
+            comp_id = str(computer_info['computers'][0]['id'])
+            status = get_status(comp_id, creds)
+            name = computer_info['computers'][0]['realname']
+            location = computer_info['computers'][0]['building_name']
+            room = computer_info['computers'][0]['room']
+            shit_list = get_shitlist(comp_id, creds)
+        get_info_screen(scan, name, status, location, room, shit_list)
+        return True
+
+def get_shitlist(comp_id, creds):
+    sendurl = 'https://zenefits.jamfcloud.com/JSSResource/computers/id/%s' % comp_id
+    header = {'Accept': 'application/json'}
+    r = requests.get(sendurl, auth=creds, headers=header)
+    response = r.json()
+    computer_memberships = response['computer']['groups_accounts']['computer_group_memberships']
+    search = re.compile(r'^Shit List:')
+    shit_list = []
+    for i in computer_memberships:
+        mo = search.match(i)
+        if mo != None:
+            shit_list.append(i)
+    return shit_list
+
+def get_status(comp_id, creds):
+    # Returns EA named Status
+    sendurl = 'https://zenefits.jamfcloud.com/JSSResource/computers/id/%s/subset/extension_attributes' % comp_id
+    header = {'Accept': 'application/json'}
+    r = requests.get(sendurl, auth=creds, headers=header)
+    response = r.json()
+    response = response['computer']['extension_attributes']
+    for items in response:
+        if items['id'] == 11:
+            return items['value']   
+
+def get_info_screen(scan, name, status, location, room, shit_list):
+    shit = ""
+    for i in shit_list:
+        shit += '[return]%s' % i
+    room_if = ""
+    if room != "":
+        room_if = "[return]Room: %s" % room
+    get_info_view="""
+    *.title = Loaner
+    # Introductory text
+    txt.type = text
+    txt.default = Loaner Computer Info[return]Asset: %s[return]Name: %s[return]Status: %s[return]Location: %s%s[return]%s
+    txt.height = 50
+    txt.width = 256
+    """ % (scan, name, status, location, room_if, shit)
+    result = PBridge.run(get_info_view)
+
+
+def activate_mode(creds, current_wks):
+    text = "*(Activate Mode)*"
+    scan = barcode_scan(text)
+    if scan == 'exit':
+        return False
+    else:
+        computer_info = get_info_computer(scan, creds)
+        if len(computer_info['computers']) == 1:
+            user_info = get_user_info(get_user(creds), creds)
+            comp_id = str(computer_info['computers'][0]['id'])
+            location = computer_info['computers'][0]['building_name']
+            returned = activate(comp_id, creds, user_info)
+            try:
+                cell = current_wks.find(scan)
+                cellRow = int(cell.row)
+                update_wks(scan, user_info, location, 'Deployed', cellRow, current_wks)
+            except Exception:
+                list_of_lists = current_wks.get_all_values()
+                new_row = len(list_of_lists) + 1
+                update_wks(scan, user_info, location, 'Deployed', new_row, current_wks)
+            result_confirm(returned)
+        else:
+            print(len(info['computers']))
+            failed_scan(len(info['computers']))
+            logger('Scan Failed![return]Computers expected 1 got %d.' % (len(info['computers'])))
+        return True
+
+def activate(comp_id, creds, user_info):
+    # Sets Status to Deployed
+    sendurl = 'https://zenefits.jamfcloud.com/JSSResource/computers/id/%s' % comp_id
+    header = {'Content-Type': 'text/xml'}
+    xml = """<?xml version="1.0" encoding="UTF-8"?>
+    <computer>
+        <location>
+            <username></username>
+            <real_name>%s</real_name>
+            <email_address>%s</email_address>
+            <department>IT</department>
+        </location>
+        <extension_attributes>
+            <attribute>
+                <name>Status</name>
+                <value>Deployed</value>
+            </attribute>
+        </extension_attributes>
+    </computer>""" % (user_info[0], user_info[1])
+    r = requests.put(sendurl, auth=creds, headers=header, data=xml).text
+    return r
+
+def deactivate_mode(creds, current_wks):
+    text = "*(Deactivate Mode)*"
+    scan = barcode_scan(text)
+    if scan == 'exit':
+        return False
+    else:
+        computer_info = get_info_computer(scan, creds)
+        if len(computer_info['computers']) == 1:
+            comp_id = str(computer_info['computers'][0]['id'])
+            location = computer_info['computers'][0]['building_name']
+            returned = deactivate(comp_id, creds)
+            name = ["", ""]
+            try:
+                cell = current_wks.find(scan)
+                cellRow = int(cell.row)
+                update_wks(scan, name, location, "Available Loaner", cellRow, current_wks)
+            except Exception:
+                list_of_lists = current_wks.get_all_values()
+                new_row = len(list_of_lists) + 1
+                update_wks(scan, name, location, "Available Loaner", new_row, current_wks)
+            result_confirm(returned)
+        else:
+            print('Computers expected 1 got %d' % (len(info['computers'])))
+            failed_scan(len(info['computers']))
+            logger('Scan Failed!\nComputers expected 1 got %d.' % (len(info['computers'])))
+        return True
+
+def deactivate(comp_id, creds):
+    sendurl = 'https://zenefits.jamfcloud.com/JSSResource/computers/id/%s' % comp_id
+    header = {'Content-Type': 'text/xml'}
+    xml = """<?xml version="1.0" encoding="UTF-8"?>
+    <computer>
+        <location>
+            <username></username>
+            <real_name></real_name>
+            <email_address></email_address>
+            <department>IT</department>
+        </location>
+        <extension_attributes>
+            <attribute>
+                <name>Status</name>
+                <value>Available Loaner</value>
+            </attribute>
+        </extension_attributes>
+    </computer>"""
+    r = requests.put(sendurl, auth=creds, headers=header, data=xml).text
+    print(r)
+    return r
+
+def update_wks(scan, user_info, location, status, row, current_wks):
+    date = time.strftime("%m/%d/%y")
+    range_val = 'A%d:F%d' % (row, row) 
+    cell_list = current_wks.range(range_val) 
+    cell_values = ['{0}'.format(date),'{0}'.format(user_info[0]),'{0}'.format(user_info[1]),'{0}'.format(scan),'{0}'.format(location),'{0}'.format(status)]
+    for i, val in enumerate(cell_values):
+        cell_list[i].value = val
+    current_wks.update_cells(cell_list)
+
+def function_select():
+    # Allows user to select function
+    function_view="""
+    *.title = Loaner
+    # Introductory text
+    txt.type = text
+    txt.default = Please select which function you would like to perform
+    txt.height = 50
+    txt.width = 256
+    # Add a popup menu
+    pop.type = popup
+    pop.label = Function
+    pop.width = 256
+    pop.option = Activate
+    pop.option = Deactivate
+    pop.option = Get Info
+    pop.default = Activate
+    # Add a cancel button with default label
+    cb.type = cancelbutton
+
+    """
+    selection = PBridge.run(function_view)
+    function = ""
+    if selection["cb"] == "1":
+        sys.exit(0)
+    elif selection["pop"] == "Activate":
+        function = selection["pop"]
+    elif selection["pop"] == "Deactivate":
+        function = selection["pop"]
+    elif selection["pop"] == "Get Info":
+        function = selection["pop"]
+    return function
+
+def result_confirm(result_value):
+    # Returns xml return after call is made
+    result_view="""
+    *.title = Updator
+    # Introductory text
+    txt.type = text
+    """
+    result_view += "\ntxt.default = %s" % result_value
+    result_view +="""
+    txt.height = 50
+    txt.width = 256
+    """
+    result = PBridge.run(result_view)
+
+def get_user(creds):
+    name_vaild = 0
+    while not name_vaild:
+        user_view="""
+        *.title = Loaner
+        txt.type = text
+        txt.default = Please enter name of user being assigned loaner
+        txt.height = 50
+        txt.height = 256
+        name.type = textfield
+        name.label =
+        name.width = 256
+        cb.type = cancelbutton
+        b.type = button
+        b.label = Go Back
+        """
+        result = PBridge.run(user_view)
+        if result["cb"] == "1":
+            sys.exit(0)
+        if result["b"] == "1":
+            name_vaild = 1
+            result["name"] = 'exit'
+        else:
+            name = '*' + result['name'] + '*'
+            print(name)
+            sendurl = 'https://zenefits.jamfcloud.com/JSSResource/computers/match/%s' % name
+            header = {'Accept': 'application/json'}
+            r = requests.get(sendurl, auth=creds, headers=header)
+            response = r.json()
+            if len(response['computers']) > 0:
+                name_vaild = 1
+                names = []
+                for i in range(len(response['computers'])):
+                    if response['computers'][i]['realname'] != '':
+                        names.append(response['computers'][i]['realname'])
+                names_view ="""
+                *.title = Loaner
+                txt.type = text
+                txt.default = Select the User:
+                txt.height = 50
+                txt.width = 256
+                pop.type = popup
+                pop.label = Users
+                pop.width = 256"""
+                for index, name in enumerate(names):
+                    names_view += "\npop.option = %s" % name
+                names_view += '\ncb.type = cancelbutton'
+                selection = PBridge.run(names_view)
+                if selection['cb'] == "1":
+                    sys.exit(0)
+                for index, name in enumerate(names):
+                    if name == selection['pop']:
+                        selected = index
+                selected_user = (names[selected])
+            else:
+                failed_search(result['name'])
+    return response['computers'][index]['id']
+
+def select_office():
+    select_office_view = """
+    *.title = Loaner
+    # Introductory text
+    txt.type = text
+    txt.default = Please select which office you are based
+    txt.height = 50
+    txt.width = 256
+    # Add a popup menu
+    pop.type = popup
+    pop.label = Location
+    pop.width = 256
+    pop.option = SF
+    pop.option = AZ
+    pop.default = SF
+    # Add a cancel button with default label
+    cb.type = cancelbutton
+    """
+    selection = PBridge.run(select_office_view)
+    office_location = ""
+    if selection['cb'] == "1":
+        sys.exit(0)
+    elif selection["pop"] == "SF":
+        office_location = selection["pop"]
+    elif selection["pop"] == "AZ":
+        office_location == selection["pop"]
+    return office_location
+
+def office_select():
+    try:
+        office = shelfFile['office']
+    except Exception:
+        office = select_office()
+        shelfFile['office'] = office
+    if office == "AZ":
+        current_wks = wks.get_worksheet(1)
+    if office == "SF":
+        current_wks = wks.get_worksheet(0)
+    return current_wks
+
+def barcode_scan(text):
+    # Asks for asset barcode using Pashua
+    barcode_vaild = 0
+    while not barcode_vaild:
+        barcode_view = """
+        *.title = Loaner
+        text.type = text
+        """
+        barcode_view += "\ntext.default = %s[return]Please Scan Asset\n" % text
+        barcode_view += """
+        text.height = 50
+        text.width = 256
+        barcode.type = textfield
+        barcode.label = 
+        barcode.width = 256
+        cb.type = cancelbutton
+        b.type = button
+        b.label = Go Back
+
+        """
+        result = PBridge.run(barcode_view)
+        print(result)
+        if result["cb"] == "1":
+            logger("User Canceled")
+            sys.exit(0)
+        if result['b'] == "1":
+            barcode_vaild = True
+            result['barcode'] = 'exit'
+        else:
+            r = re.compile(r'[0-9]{8}')
+            rfind = r.findall(result['barcode'])
+            if rfind:
+                barcode_vaild = 1
+            else:
+                failed_scan(0)
+    return result['barcode']
+
+def failed_search(name):
+    # Produces Pashua that asset was not found
+    failed_view="""
+    *.title = Updator
+    # Introductory text
+    txt.type = text
+    """
+    failed_view += "\ntxt.default = Search Failed![return]Could not find User: %s.\n" % name
+    failed_view += """
+    txt.height = 50
+    txt.width = 256
+    """
+    result = PBridge.run(failed_view)
+
+def failed_scan(number):
+    # Produces Pashua that asset was not found
+    failed_view="""
+    *.title = Updator
+    # Introductory text
+    txt.type = text
+    """
+    failed_view += "\ntxt.default = Scan Failed![return]Computers expected 1 got %d.[return]Please finish manually!\n" % number
+    failed_view += """
+    txt.height = 50
+    txt.width = 256
+    """
+    result = PBridge.run(failed_view)
+
+def logger(message):
+    syslog.syslog(syslog.LOG_ALERT, message)
+
+def process_loop(creds, current_wks):
+    """
+    Docstring incoming
+    """
+    function = function_select()
+    keep_going = True
+    while keep_going:
+        if function == 'Activate':
+            keep_going = activate_mode(creds, current_wks)
+        elif function == 'Deactivate':
+            keep_going = deactivate_mode(creds, current_wks)
+        elif function == 'Get Info':
+            keep_going = get_info_mode(creds, current_wks)
+
+def main_loop():
+    creds = login()
+    current_wks = office_select()
+    while True:
+        process_loop(creds, current_wks)
+
+# Main
+
+if __name__ == "__main__":
+    logger("Starting Loaner")
+    main_loop()
+    logger("Loaner has exited")
